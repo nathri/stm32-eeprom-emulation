@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Build & test (host)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and run test suite
+        run: make run
+
+  misra:
+    name: MISRA-C:2012 static analysis (cppcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+
+      - name: Run MISRA-C:2012 scan
+        # Mirrors the command documented in IMPLEMENTATION_NOTES.md.
+        # Scoped to src/eeprom.c only: eeprom.h is declarations-only, and
+        # test/test_eeprom.c is explicitly host-only test code, not part
+        # of the shipped library (see its own file header comment).
+        #
+        # cppcheck-suppressions.txt lists only the specific, documented
+        # deviations recorded in IMPLEMENTATION_NOTES.md - any OTHER MISRA
+        # finding, on any rule not in that list, fails this step.
+        run: |
+          cppcheck --addon=misra --enable=all --inconclusive -I inc \
+            --suppressions-list=cppcheck-suppressions.txt \
+            --error-exitcode=1 \
+            src/eeprom.c
