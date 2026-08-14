@@ -1,0 +1,34 @@
+# cppcheck suppression list for the MISRA-C:2012 scan of src/eeprom.c.
+#
+# Every entry here is a documented, deliberate deviation - see
+# IMPLEMENTATION_NOTES.md, section "MISRA-C:2012 Deviation Record
+# (cppcheck --addon=misra)", for the full justification for each one.
+# This file exists so CI can fail on any NEW or unexpected MISRA finding
+# while staying quiet about the ones already reviewed and accepted below.
+# Do not add an entry here without a matching entry in that section.
+#
+# Used by: .github/workflows/ci.yml, and locally via:
+#   cppcheck --addon=misra --enable=all --inconclusive -I inc \
+#     --suppressions-list=cppcheck-suppressions.txt src/eeprom.c
+
+# Rule 8.9 - g_write_record_buf, g_compact_sector_buf,
+# g_write_record_crc_input deliberately promoted to static/file scope to
+# remove ~800 bytes of worst-case stack depth from the write/GC call chain.
+misra-c2012-8.9:src/eeprom.c
+
+# Rule 15.4 - scan_sector_records()'s single scan loop has three
+# semantically distinct, necessary exit points (I/O failure, free space
+# found, corrupted record found).
+misra-c2012-15.4:src/eeprom.c
+
+# Rule 15.5 - early-return guard clauses used throughout for error
+# handling; the project's established convention. Every early return is a
+# guard clause with nothing to clean up.
+misra-c2012-15.5:src/eeprom.c
+
+# Rule 8.7 - the 7 public API functions (eeprom_init, eeprom_write,
+# eeprom_read, eeprom_exists, eeprom_get_stats, eeprom_garbage_collect,
+# eeprom_format) are non-static because they ARE the library's public API,
+# declared in inc/eeprom.h and called from outside this translation unit -
+# a fact this single-file scan has no visibility into.
+misra-c2012-8.7:src/eeprom.c
