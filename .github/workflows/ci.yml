@@ -26,18 +26,39 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cppcheck
+          cppcheck --version
 
       - name: Run MISRA-C:2012 scan
-        # Mirrors the command documented in IMPLEMENTATION_NOTES.md.
         # Scoped to src/eeprom.c only: eeprom.h is declarations-only, and
         # test/test_eeprom.c is explicitly host-only test code, not part
         # of the shipped library (see its own file header comment).
         #
+        # --enable=all is required, not cosmetic: without it the misra
+        # addon produces zero misra-c2012-* findings at all with this
+        # cppcheck build (verified locally) - it also enables cppcheck's
+        # own native checks (e.g. unusedFunction), which are irrelevant to
+        # MISRA compliance and are deliberately NOT part of the pass/fail
+        # gate below (see the grep step).
+        #
         # cppcheck-suppressions.txt lists only the specific, documented
-        # deviations recorded in IMPLEMENTATION_NOTES.md - any OTHER MISRA
-        # finding, on any rule not in that list, fails this step.
+        # deviations recorded in IMPLEMENTATION_NOTES.md (MISRA-C:2012
+        # Deviation Record) - anything cppcheck reports as misra-c2012-*
+        # that ISN'T in that file survives to the grep check below and
+        # fails this job. Given this codebase currently has zero
+        # Required/Mandatory MISRA violations (see that section), any
+        # unsuppressed misra-c2012-* finding is either a Required/Mandatory
+        # violation or a newly-introduced, not-yet-reviewed Advisory one -
+        # either way, it needs a human to look at it before merging, not a
+        # silent pass.
         run: |
+          set -o pipefail
           cppcheck --addon=misra --enable=all --inconclusive -I inc \
             --suppressions-list=cppcheck-suppressions.txt \
-            --error-exitcode=1 \
-            src/eeprom.c
+            src/eeprom.c 2>&1 | tee cppcheck-output.txt
+
+          if grep -q "misra-c2012-" cppcheck-output.txt; then
+            echo "::error::Unsuppressed MISRA-C:2012 finding(s) - not in cppcheck-suppressions.txt. See IMPLEMENTATION_NOTES.md (MISRA-C:2012 Deviation Record) to review and either fix the code or document a new deviation."
+            exit 1
+          fi
+
+          echo "No unsuppressed MISRA-C:2012 findings."
