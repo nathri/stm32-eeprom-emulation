@@ -70,7 +70,7 @@ static eeprom_config_t make_config(void)
     cfg.flash_start = FLASH_BASE;
     cfg.sector_size = SECTOR_SIZE;
     cfg.num_sectors = (uint8_t)NUM_SECTORS;
-    cfg.write_width = 4U;
+    cfg.write_width = 16U; /* STM32U5 quad-word Flash program granularity - the only value eeprom_init() now accepts */
     cfg.flash_read = flash_read_mock;
     cfg.flash_write = flash_write_mock;
     cfg.flash_erase = flash_erase_mock;
@@ -88,7 +88,13 @@ static void reset_flash(void)
 static eeprom_config_t make_small_config(void)
 {
     eeprom_config_t cfg = make_config();
-    cfg.sector_size = 1024U;
+    /* Post-ECC-redesign: SECTOR_HEADER_SIZE grew 16 -> 48 bytes and
+     * write_width-16 padding is coarser than the old width-4 padding, so
+     * 1024 (the pre-redesign value) is no longer enough headroom for
+     * TC-009's 20 live 64-byte-payload records. Bumped to keep this
+     * config's "small enough to force many rotations" purpose intact
+     * while comfortably fitting the new per-record overhead. */
+    cfg.sector_size = 1120U;
     return cfg;
 }
 
@@ -118,7 +124,14 @@ static int flash_erase_selective_fail_mock(uint32_t addr, uint32_t size)
 static eeprom_config_t make_gc_regression_config(void)
 {
     eeprom_config_t cfg = make_config();
-    cfg.sector_size = 256U;
+    /* Post-ECC-redesign: AUDIT-1 depends on exactly 8 of its 20-byte-
+     * payload records filling one sector and a 9th not fitting, to land
+     * its crash window deterministically. record_padded_size(20) is now
+     * 32 bytes (align_up(4+20+2, 16), vs 28 pre-redesign), and
+     * SECTOR_HEADER_SIZE is now 48 (vs 16) - so usable space must be
+     * >= 8*32=256 and < 9*32=288. 304 (usable 256) hits that exactly,
+     * mirroring the original config's intent at the new granularity. */
+    cfg.sector_size = 304U;
     cfg.num_sectors = 4U;
     cfg.flash_erase = flash_erase_selective_fail_mock;
     return cfg;
@@ -495,7 +508,7 @@ static bool tc_011(void)
      * bytes, data starts right after). This alone is sufficient to break
      * the CRC16 check with overwhelming probability. */
     {
-        uint32_t data_addr = FLASH_BASE + 16U /* sector header */ + 4U /* record header */;
+        uint32_t data_addr = FLASH_BASE + 48U /* sector header, post-ECC-redesign */ + 4U /* record header */;
         *flash_byte(data_addr) ^= 0x01U;
     }
 
@@ -621,12 +634,12 @@ static bool tc_014(void)
         uint32_t active_addr;
         uint8_t partial_hdr[4] = { 0xFFU, 0x34U, 0x12U, 0x08U };
 
-        /* The one prior write (4 bytes of data) padded to a write_width=4
+        /* The one prior write (4 bytes of data) padded to a write_width=16
          * boundary occupies 4 (record header) + 4 (data) + 2 (CRC) = 10
-         * bytes, rounded up to 12. It lands right after the 16-byte
+         * bytes, rounded up to 16. It lands right after the 48-byte
          * sector header in sector 0, so the next (about-to-be-truncated)
-         * record starts at header(16) + first-record(12) = offset 28. */
-        active_addr = FLASH_BASE + 16U + 12U;
+         * record starts at header(48) + first-record(16) = offset 64. */
+        active_addr = FLASH_BASE + 48U + 16U;
         (void)flash_write_mock(active_addr, partial_hdr, 4U);
         /* Remaining bytes are left at 0xFF: an untouched region, exactly
          * like a write that was interrupted before reaching them. */
@@ -1075,14 +1088,14 @@ static bool tc_audit_gc_preserves_corrupted_record(void)
     g_fail_erase_addr = 0xFFFFFFFFU;
     CHECK(eeprom_init(&cfg) == EEPROM_OK, "init failed");
 
-    /* First-ever write lands at sector 0, offset SECTOR_HEADER_SIZE (16)
-     * from the sector base - the record header's status byte is
-     * therefore at exactly FLASH_BASE + 16 (see TC-011's identical
-     * addressing for the record's data byte, at + 4 more). */
+    /* First-ever write lands at sector 0, offset SECTOR_HEADER_SIZE (48,
+     * post-ECC-redesign) from the sector base - the record header's
+     * status byte is therefore at exactly FLASH_BASE + 48 (see TC-011's
+     * identical addressing for the record's data byte, at + 4 more). */
     CHECK(eeprom_write(0x0005U, data, sizeof(data)) == EEPROM_OK, "seed write failed");
     CHECK(eeprom_exists(0x0005U), "seed record not visible before corruption");
 
-    *flash_byte(FLASH_BASE + 16U) ^= 0x01U; /* VALID (0xFF) -> 0xFE: neither VALID nor INVALID */
+    *flash_byte(FLASH_BASE + 48U) ^= 0x01U; /* VALID (0xFF) -> 0xFE: neither VALID nor INVALID */
 
     sz = sizeof(rd);
     CHECK(eeprom_read(0x0005U, rd, &sz) == EEPROM_CHECKSUM_ERROR,
@@ -1146,8 +1159,8 @@ static bool tc_audit_transient_read_failure_during_scan(void)
     CHECK(eeprom_write(0x0006U, second, sizeof(second)) == EEPROM_OK, "second write failed");
 
     /* First record's header is at sector 0 base + SECTOR_HEADER_SIZE
-     * (16); one transient failure reading it. */
-    g_fail_read_addr = FLASH_BASE + 16U;
+     * (48, post-ECC-redesign); one transient failure reading it. */
+    g_fail_read_addr = FLASH_BASE + 48U;
     g_fail_read_remaining = 1U;
     CHECK(eeprom_init(&cfg) == EEPROM_OK, "re-init failed (part A)");
     g_fail_read_addr = 0xFFFFFFFFU;
