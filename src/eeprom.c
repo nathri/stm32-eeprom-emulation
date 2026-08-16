@@ -101,6 +101,15 @@
 #define RECORD_STATUS_VALID   ((uint8_t)0xFFU)
 #define RECORD_STATUS_INVALID ((uint8_t)0x00U)
 
+/* Bounded retry count for a record-header read that fails during recovery
+ * scanning (scan_sector_records()). A flash_read() failure means the I/O
+ * attempt itself faulted, not that the underlying data is bad (see
+ * validate_record()'s doc comment on that same distinction) - a single
+ * failed attempt is not evidence the sector's tail was cut off by a power
+ * loss, so a transient glitch is given a bounded chance to clear before
+ * that conclusion is drawn. */
+#define SCAN_HEADER_READ_RETRIES ((uint8_t)3U)
+
 #define LOOKUP_EMPTY          ((uint32_t)0xFFFFFFFFU)
 #define SEQUENCE_ERASED_MARK  ((uint32_t)0xFFFFFFFFU)
 
@@ -229,8 +238,25 @@ static int read_sector_header(uint8_t sector_index, uint32_t *sequence,
                                uint8_t *state, uint32_t *erase_count)
 {
     uint8_t buf[16];
+    uint8_t attempt;
+    int read_rc = -1;
 
-    if (g_config.flash_read(get_sector_address(sector_index), buf, (uint16_t)sizeof(buf)) != 0) {
+    /* Same bounded-retry rationale as scan_sector_records()'s record
+     * header read: a flash_read() failure here means the I/O attempt
+     * faulted, not that the sector header itself is bad. Without this,
+     * scan_all_sectors() treats a single transient glitch identically to
+     * a genuinely corrupt header and destructively erases the sector -
+     * for the ACTIVE sector, that means real, uncorrupted application
+     * data. Audit fix, found the same way as the record-header case:
+     * property-based, randomized-reboot stress testing that injected
+     * standalone read failures with no data corruption at all. */
+    for (attempt = 0; attempt < SCAN_HEADER_READ_RETRIES; attempt++) {
+        read_rc = g_config.flash_read(get_sector_address(sector_index), buf, (uint16_t)sizeof(buf));
+        if (read_rc == 0) {
+            break;
+        }
+    }
+    if (read_rc != 0) {
         return -1;
     }
     *sequence = load_u32(&buf[0]);
@@ -765,8 +791,31 @@ static void scan_sector_records(uint8_t sector_index)
 
     while ((cur + RECORD_HEADER_SIZE) <= g_config.sector_size) {
         uint8_t hdr[RECORD_HEADER_SIZE];
+        uint8_t attempt;
+        int read_rc = -1;
 
-        if (g_config.flash_read(base + cur, hdr, RECORD_HEADER_SIZE) != 0) {
+        for (attempt = 0; attempt < SCAN_HEADER_READ_RETRIES; attempt++) {
+            read_rc = g_config.flash_read(base + cur, hdr, RECORD_HEADER_SIZE);
+            if (read_rc == 0) {
+                break;
+            }
+        }
+        if (read_rc != 0) {
+            /* Every attempt faulted - audit fix: an earlier version gave
+             * up after one flash_read() failure here and treated it
+             * exactly like a genuinely truncated sector tail, which (for
+             * an ACTIVE sector) drove recover_partial_sector() to
+             * PERMANENTLY invalidate whatever record was actually at
+             * this offset via a real Flash write - destroying data that,
+             * per this file's own READ_FAILED semantics, may never have
+             * been corrupted at all, only transiently unreadable on that
+             * one attempt (found by property-based stress testing that
+             * injected standalone random read failures with no data
+             * corruption whatsoever and still lost previously-committed
+             * records). Still treated as
+             * broken_tail after exhausting retries: at that point a
+             * genuinely undecodable header is the most defensible
+             * remaining assumption. */
             broken_tail = true;
             break;
         }
@@ -788,12 +837,40 @@ static void scan_sector_records(uint8_t sector_index)
                 fits = ((cur + (uint32_t)rec_total) <= g_config.sector_size);
             }
 
-            if ((!addr_ok) || (!size_ok) || (!fits) ||
-                ((status != RECORD_STATUS_VALID) && (status != RECORD_STATUS_INVALID))) {
+            if ((!addr_ok) || (!size_ok) || (!fits)) {
+                /* Length itself is undecodable (or would overrun the
+                 * sector) - this, and only this, is the case where we
+                 * genuinely cannot know how many bytes to skip to find
+                 * the next record, so it's the one legitimate reason to
+                 * stop scanning here (see recover_partial_sector() for
+                 * ACTIVE sectors below). */
                 broken_tail = true;
                 break;
             }
 
+            /* A structurally decodable header (addr/size in range, fits
+             * the sector) whose status byte is neither VALID nor INVALID
+             * means THIS record's own bytes were corrupted after being
+             * fully committed - e.g. a single bit flip applied post-write
+             * (found by property-based stress testing) - not that the
+             * sector's tail was cut off by a power loss. Its length is
+             * still trustworthy,
+             * so unlike the undecodable case above, it's both safe AND
+             * necessary to skip over it (like an explicitly
+             * RECORD_STATUS_INVALID record already is) and keep
+             * scanning, rather than stopping.
+             *
+             * Audit fix: this used to be folded into the same
+             * broken_tail path as an undecodable header, which meant any
+             * single corrupted record silently dropped every record
+             * physically written after it in the same sector from
+             * g_lookup - including perfectly intact, later ones - the
+             * moment this sector was rescanned (e.g. on the next
+             * eeprom_init()). Property-based stress testing (randomized
+             * bit-corruption + simulated reboots) surfaced this as
+             * EEPROM_NOT_FOUND for addresses with a confirmed prior
+             * write.
+             */
             if (status == RECORD_STATUS_VALID) {
                 g_lookup[addr] = base + cur;
             }

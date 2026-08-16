@@ -124,6 +124,33 @@ static eeprom_config_t make_gc_regression_config(void)
     return cfg;
 }
 
+/* Regression test infrastructure for the bounded-retry fix (see
+ * IMPLEMENTATION_NOTES.md's "Property-based stress testing findings"):
+ * lets a test make flash_read() fail a specific COUNT of times for one
+ * exact address before succeeding, simulating a transient (not
+ * permanent) I/O glitch during recovery scanning - as opposed to
+ * flash_erase_selective_fail_mock's unconditional/permanent failure. */
+static uint32_t g_fail_read_addr = 0xFFFFFFFFU;
+static uint8_t  g_fail_read_remaining = 0U;
+
+static int flash_read_selective_fail_mock(uint32_t addr, uint8_t *data, uint16_t size)
+{
+    if ((addr == g_fail_read_addr) && (g_fail_read_remaining > 0U)) {
+        g_fail_read_remaining--;
+        return -1;
+    }
+    return flash_read_mock(addr, data, size);
+}
+
+static eeprom_config_t make_read_retry_regression_config(void)
+{
+    eeprom_config_t cfg = make_config();
+    cfg.sector_size = 256U;
+    cfg.num_sectors = 4U;
+    cfg.flash_read = flash_read_selective_fail_mock;
+    return cfg;
+}
+
 /* --------------------------------------------------------------------- */
 /* Minimal test framework                                                  */
 /* --------------------------------------------------------------------- */
@@ -1083,6 +1110,79 @@ static bool tc_audit_gc_preserves_corrupted_record(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* AUDIT-4: a single transient read failure during recovery scanning must */
+/* not be treated as permanent corruption (regression test for a bug      */
+/* found by property-based stress testing)                                */
+/* --------------------------------------------------------------------- */
+
+static bool tc_audit_transient_read_failure_during_scan(void)
+{
+    /* Both scan_sector_records()'s per-record header read and
+     * read_sector_header()'s per-sector header read used to give up
+     * immediately on a single flash_read() failure, treating a transient
+     * I/O glitch exactly like a genuinely broken header - for the
+     * record-header case, discarding records from g_lookup; for the
+     * sector-header case, having scan_all_sectors() erase the sector
+     * outright, including the ACTIVE one holding live application data.
+     *
+     * Part A targets one transient failure on a RECORD header read; Part
+     * B targets one on a SECTOR header read. Both must fully recover.
+     */
+    eeprom_config_t cfg = make_read_retry_regression_config();
+    uint8_t first[8];
+    uint8_t second[8];
+    uint8_t rd[8];
+    uint8_t sz;
+
+    memset(first, 0x33U, sizeof(first));
+    memset(second, 0x44U, sizeof(second));
+
+    /* Part A: record header read. */
+    reset_flash();
+    g_fail_read_addr = 0xFFFFFFFFU;
+    g_fail_read_remaining = 0U;
+    CHECK(eeprom_init(&cfg) == EEPROM_OK, "init failed (part A)");
+    CHECK(eeprom_write(0x0005U, first, sizeof(first)) == EEPROM_OK, "first write failed");
+    CHECK(eeprom_write(0x0006U, second, sizeof(second)) == EEPROM_OK, "second write failed");
+
+    /* First record's header is at sector 0 base + SECTOR_HEADER_SIZE
+     * (16); one transient failure reading it. */
+    g_fail_read_addr = FLASH_BASE + 16U;
+    g_fail_read_remaining = 1U;
+    CHECK(eeprom_init(&cfg) == EEPROM_OK, "re-init failed (part A)");
+    g_fail_read_addr = 0xFFFFFFFFU;
+
+    sz = sizeof(rd);
+    CHECK(eeprom_read(0x0005U, rd, &sz) == EEPROM_OK, "record at the glitched header was lost");
+    CHECK(memcmp(rd, first, sizeof(first)) == 0, "record at the glitched header was corrupted");
+    sz = sizeof(rd);
+    CHECK(eeprom_read(0x0006U, rd, &sz) == EEPROM_OK,
+          "record written AFTER the glitched one was lost - scan stopped early");
+    CHECK(memcmp(rd, second, sizeof(second)) == 0, "record after the glitched one was corrupted");
+
+    /* Part B: sector header read. */
+    reset_flash();
+    g_fail_read_addr = 0xFFFFFFFFU;
+    g_fail_read_remaining = 0U;
+    CHECK(eeprom_init(&cfg) == EEPROM_OK, "init failed (part B)");
+    CHECK(eeprom_write(0x0007U, first, sizeof(first)) == EEPROM_OK, "part B write failed");
+
+    /* Sector 0 (the active sector, holding the write above) is at
+     * FLASH_BASE + 0; one transient failure reading ITS header. */
+    g_fail_read_addr = FLASH_BASE;
+    g_fail_read_remaining = 1U;
+    CHECK(eeprom_init(&cfg) == EEPROM_OK, "re-init failed (part B)");
+    g_fail_read_addr = 0xFFFFFFFFU;
+
+    sz = sizeof(rd);
+    CHECK(eeprom_read(0x0007U, rd, &sz) == EEPROM_OK,
+          "active sector was destructively erased over one transient header-read glitch");
+    CHECK(memcmp(rd, first, sizeof(first)) == 0, "surviving record was corrupted");
+
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                   */
 /* --------------------------------------------------------------------- */
 
@@ -1110,6 +1210,7 @@ static const test_case_t k_tests[] = {
     { "AUDIT-1", "GC power loss with spare (regression)", tc_audit_gc_power_loss },
     { "AUDIT-2", "erase_count persists across reboot (regression)", tc_audit_erase_count_persists_empty_sector },
     { "AUDIT-3", "GC preserves corrupted record (regression)", tc_audit_gc_preserves_corrupted_record },
+    { "AUDIT-4", "Transient read failure during scan (regression)", tc_audit_transient_read_failure_during_scan },
 };
 
 int main(void)
