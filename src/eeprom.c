@@ -151,7 +151,11 @@
 #define RECORD_MAX_PADDED_SIZE ((uint16_t)272U)
 
 #define RECORD_STATUS_VALID   ((uint8_t)0xFFU)
-#define RECORD_STATUS_INVALID ((uint8_t)0x00U)
+/* Pre-ECC-redesign versions of this format also wrote 0x00 here (via the
+ * since-removed invalidate_record()) to mark a superseded record. This
+ * library no longer ever writes that value - see this file's header
+ * comment - but a status byte of 0x00 in an on-flash dump predating the
+ * redesign means "invalidated," not "corrupted." */
 
 /* Bounded retry count for a record-header read that fails during recovery
  * scanning (scan_sector_records()). A flash_read() failure means the I/O
