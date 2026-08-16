@@ -1,0 +1,13 @@
+test/test_eeprom
+test/test_eeprom.exe
+*.o
+*.obj
+cppcheck-output.txt
+
+# Private, unredacted working copies (full implementation-level detail,
+# internal process notes) -- never committed. See README.md/
+# IMPLEMENTATION_NOTES.md/EEPROM_SPEC.md for the public versions of
+# these documents.
+README.local.md
+IMPLEMENTATION_NOTES.local.md
+EEPROM_SPEC.local.md
