@@ -68,19 +68,15 @@
 
 #define SECTOR_HEADER_SIZE   ((uint32_t)16U)
 
-#define SECTOR_STATE_EMPTY   ((uint8_t)0xFFU)
-#define SECTOR_STATE_ACTIVE  ((uint8_t)0xFEU)
-#define SECTOR_STATE_FULL    ((uint8_t)0xFCU)
-/* Destination of an in-progress/completed garbage-collection compaction.
- * Reachable from EMPTY by clearing bit 1 only - independent of the
- * ACTIVE(clears bit0)/FULL(clears bit0+bit1) chain, so it can never be
- * confused with "the sector real application writes go to" regardless of
- * physical sector index or sequence number. See the audit-fix comment on
- * perform_garbage_collection() for why that distinction is load-bearing:
- * without it, a manually-triggered GC that promotes a spare sector and is
- * then interrupted by a power loss can leave TWO sectors reading as
- * ACTIVE, and eeprom_init() has no way to tell which one is real. */
-#define SECTOR_STATE_GC_DEST ((uint8_t)0xFDU)
+/* Aliases of the public EEPROM_SECTOR_STATE_* constants (inc/eeprom.h),
+ * not a second definition - see that header for the value/rationale
+ * (including why GC_DEST clears a bit independent of the ACTIVE/FULL
+ * chain) and eeprom_get_stats() for where these become visible to
+ * callers via eeprom_stats_t.sector_state[]. */
+#define SECTOR_STATE_EMPTY   EEPROM_SECTOR_STATE_EMPTY
+#define SECTOR_STATE_ACTIVE  EEPROM_SECTOR_STATE_ACTIVE
+#define SECTOR_STATE_FULL    EEPROM_SECTOR_STATE_FULL
+#define SECTOR_STATE_GC_DEST EEPROM_SECTOR_STATE_GC_DEST
 
 /* The free-space scan in scan_sector_records() treats a fully-erased
  * record header (0xFF 0xFF 0xFF 0xFF) as unambiguous proof that no record
@@ -1167,6 +1163,8 @@ bool eeprom_exists(uint16_t addr)
 
 eeprom_status_t eeprom_get_stats(eeprom_stats_t *stats)
 {
+    uint8_t i;
+
     if (!g_initialized) {
         return EEPROM_UNINITIALIZED;
     }
@@ -1174,6 +1172,14 @@ eeprom_status_t eeprom_get_stats(eeprom_stats_t *stats)
         return EEPROM_FORMAT_ERROR;
     }
     *stats = g_stats;
+    /* Sector state lives in g_sectors, not g_stats: unlike erase_count/
+     * sector_usage (mirrored into g_stats at every transition site so
+     * they read consistently even mid-operation), state is read straight
+     * from the live source of truth here rather than adding a fifth
+     * mirroring call site for a diagnostics-only field. */
+    for (i = 0; i < g_config.num_sectors; i++) {
+        stats->sector_state[i] = g_sectors[i].state;
+    }
     return EEPROM_OK;
 }
 

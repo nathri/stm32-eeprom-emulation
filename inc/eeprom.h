@@ -98,6 +98,26 @@ typedef struct {
 } eeprom_config_t;
 
 /**
+ * @brief Per-sector state byte values reported via
+ * eeprom_stats_t.sector_state[]. This IS eeprom.c's own internal on-flash
+ * state encoding (not a separate diagnostics-only numbering) - eeprom.c's
+ * private SECTOR_STATE_* constants are aliases of these, not a second
+ * definition, so the two can never drift apart.
+ */
+#define EEPROM_SECTOR_STATE_EMPTY    ((uint8_t)0xFFU) /**< Erased; not currently in use. */
+#define EEPROM_SECTOR_STATE_ACTIVE   ((uint8_t)0xFEU) /**< Currently receiving new writes. */
+#define EEPROM_SECTOR_STATE_FULL     ((uint8_t)0xFCU) /**< Full; awaiting garbage collection. */
+/* Destination of an in-progress/completed garbage-collection compaction.
+ * Reachable from EMPTY by clearing bit 1 only - independent of the
+ * ACTIVE(clears bit0)/FULL(clears bit0+bit1) chain, so it can never be
+ * confused with "the sector real application writes go to" regardless of
+ * physical sector index or sequence number. Without that distinction, a
+ * manually-triggered GC that promotes a spare sector and is then
+ * interrupted by a power loss could leave TWO sectors reading as ACTIVE,
+ * with eeprom_init() having no way to tell which one is real. */
+#define EEPROM_SECTOR_STATE_GC_DEST  ((uint8_t)0xFDU)
+
+/**
  * @brief Runtime usage statistics, primarily for diagnostics/telemetry.
  */
 typedef struct {
@@ -106,6 +126,7 @@ typedef struct {
     uint32_t gc_runs;                             /**< Lifetime count of completed garbage-collection cycles. */
     uint32_t erase_count[EEPROM_MAX_SECTORS];     /**< Per-sector lifetime erase count. */
     uint32_t sector_usage[EEPROM_MAX_SECTORS];    /**< Per-sector bytes currently used (from sector header to write pointer). */
+    uint8_t  sector_state[EEPROM_MAX_SECTORS];    /**< Per-sector state, one of EEPROM_SECTOR_STATE_*. Only indices below the num_sectors passed to eeprom_init() are meaningful. */
     uint8_t  oldest_sector;                       /**< Index of the sector that will be targeted by the next garbage collection. */
 } eeprom_stats_t;
 

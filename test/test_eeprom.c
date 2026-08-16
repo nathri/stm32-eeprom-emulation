@@ -1183,6 +1183,67 @@ static bool tc_audit_transient_read_failure_during_scan(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* TC-021: Sector State Exposed via Stats                                 */
+/* --------------------------------------------------------------------- */
+
+static bool tc_021(void)
+{
+    /* eeprom_stats_t.sector_state is a new diagnostics-only field (see
+     * inc/eeprom.h's EEPROM_SECTOR_STATE_* constants) added so a
+     * downstream diagnostics/GUI consumer can show real sector state
+     * instead of guessing it from usage/erase-count heuristics. TC-018
+     * established the state machine's *effects* black-box; this test
+     * confirms the newly-exposed field itself reports plausible, known
+     * values at two checkpoints. */
+    eeprom_config_t cfg = make_small_config();
+    uint8_t data[64];
+    eeprom_stats_t stats;
+    uint32_t i;
+    uint32_t active_count;
+    uint32_t empty_count;
+
+    memset(data, 0x77, sizeof(data));
+
+    reset_flash();
+    CHECK(eeprom_init(&cfg) == EEPROM_OK, "init failed");
+
+    /* Right after init on blank flash: exactly one sector ACTIVE, the
+     * rest EMPTY -- nothing has been written yet, so FULL/GC_DEST cannot
+     * appear. */
+    CHECK(eeprom_get_stats(&stats) == EEPROM_OK, "initial get_stats failed");
+    active_count = 0U;
+    empty_count = 0U;
+    for (i = 0; i < NUM_SECTORS; i++) {
+        if (stats.sector_state[i] == EEPROM_SECTOR_STATE_ACTIVE) { active_count++; }
+        else if (stats.sector_state[i] == EEPROM_SECTOR_STATE_EMPTY) { empty_count++; }
+    }
+    CHECK(active_count == 1U, "expected exactly one ACTIVE sector after init");
+    CHECK(empty_count == (NUM_SECTORS - 1U), "expected all other sectors EMPTY after init");
+
+    /* Drive enough writes to force at least one full rotation (fill +
+     * GC), then confirm every reported state is one of the four known
+     * constants (no undecoded/garbage byte leaks through) and exactly one
+     * sector is still ACTIVE (the invariant a single active writer must
+     * hold at all times, mid-rotation or not). */
+    for (i = 0; i < 200U; i++) {
+        eeprom_status_t rc = eeprom_write((uint16_t)(i % 6U), data, sizeof(data));
+        CHECK((rc == EEPROM_OK) || (rc == EEPROM_SECTOR_FULL), "unexpected write status during fill");
+    }
+    CHECK(eeprom_get_stats(&stats) == EEPROM_OK, "post-write get_stats failed");
+    active_count = 0U;
+    for (i = 0; i < NUM_SECTORS; i++) {
+        uint8_t s = stats.sector_state[i];
+        CHECK((s == EEPROM_SECTOR_STATE_EMPTY) || (s == EEPROM_SECTOR_STATE_ACTIVE) ||
+              (s == EEPROM_SECTOR_STATE_FULL) || (s == EEPROM_SECTOR_STATE_GC_DEST),
+              "sector_state reported an undecoded value");
+        if (s == EEPROM_SECTOR_STATE_ACTIVE) { active_count++; }
+    }
+    CHECK(active_count == 1U, "expected exactly one ACTIVE sector after sustained writes");
+
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                   */
 /* --------------------------------------------------------------------- */
 
@@ -1211,6 +1272,7 @@ static const test_case_t k_tests[] = {
     { "AUDIT-2", "erase_count persists across reboot (regression)", tc_audit_erase_count_persists_empty_sector },
     { "AUDIT-3", "GC preserves corrupted record (regression)", tc_audit_gc_preserves_corrupted_record },
     { "AUDIT-4", "Transient read failure during scan (regression)", tc_audit_transient_read_failure_during_scan },
+    { "TC-021", "Sector State Exposed via Stats",     tc_021 },
 };
 
 int main(void)
