@@ -30,16 +30,33 @@ wear-leveling and garbage collection.
 
 ## Status
 
-This is a **beta** library that has been through one round of independent
-code review, which found and led to fixing a critical bug (see
-"Independent audit findings" in [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md)).
-It has **not** been run on real STM32 hardware — verification so far is a
-host-simulated test suite (`test/test_eeprom.c`, a RAM-backed mock Flash
-modeling real NOR-Flash AND-only write semantics) plus static analysis.
-See [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md) for the full list of
-what has and hasn't been verified, including a Flash/ECC compatibility
-caveat that specifically needs checking against your target part before
-shipping on newer STM32 families (L4/G4/H7/U5).
+This is a **beta** library that has been through two rounds of independent
+review (see "Independent audit findings" in
+[IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md)):
+
+- An initial audit that found and led to fixing a critical silent-data-loss
+  bug.
+- A second review, done during design work ahead of STM32U5 hardware
+  bring-up (before any board time, not in response to a failure), which
+  found that the original sector-header and record-invalidation design
+  relied on reprogramming an already-programmed Flash word — safe on
+  plain AND-only Flash, but not reliably supported on STM32U5's
+  ECC-protected Flash. Fixed: sector state is now tracked via
+  write-once-per-erase-cycle header fields instead of a single mutated
+  byte, record invalidation was removed entirely (the in-RAM lookup table
+  was already the real source of truth), and a torn/partially-written
+  trailing record is now left alone and reclaimed by the next garbage
+  collection instead of being written to a second time. `write_width` is
+  now fixed at 16 bytes (STM32U5's confirmed quad-word program
+  granularity).
+
+It has **not** been run on real STM32 hardware — verification so far is
+code review plus a host-simulated test suite (`test/test_eeprom.c`, a
+RAM-backed mock Flash) and static analysis; see
+[IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md) for the full,
+currently-accurate list of what has and hasn't been verified, including
+where the host test suite itself still needs porting to the new
+`write_width=16` layout.
 
 ## Usage
 
@@ -66,7 +83,7 @@ int main(void) {
         .flash_start = 0x080E0000U,
         .sector_size = 64U * 1024U,
         .num_sectors = 3U,
-        .write_width = 4U,
+        .write_width = 16U,  /* fixed: STM32U5 quad-word Flash program granularity */
         .flash_read  = flash_read_impl,
         .flash_write = flash_write_impl,
         .flash_erase = flash_erase_impl,

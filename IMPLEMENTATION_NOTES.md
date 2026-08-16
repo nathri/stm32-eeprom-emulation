@@ -85,16 +85,44 @@ review's description of it) and are now fixed and regression-tested:
   fix a known defect); freedom from undefined behavior (clean under
   AddressSanitizer/UndefinedBehaviorSanitizer across all fixes).
 
-- **Flagged, not fixed here (needs target-hardware verification, not a
-  code change)**: several STM32 Flash families with ECC-protected Flash
-  (many L4/G4/H7/U5 parts) do not reliably support a second partial
-  program to an already-programmed word, even one that only clears
-  additional bits — which is exactly the pattern this library's
-  invalidate/state-transition writes rely on. F1/F4 (non-ECC) are
-  generally fine; this must be checked against the actual target part's
-  Flash/ECC behavior before shipping on any newer STM32 family. The host
-  mock's simple AND-semantics model cannot catch this, since it doesn't
-  model ECC at all.
+- **Fixed — STM32U5 (and other ECC-protected Flash families) do not
+  reliably support a second program to an already-programmed word, even
+  one that only clears further bits.** Found and fixed during design
+  review, before any hardware bring-up — not a bug report following a
+  field or bench failure. The original design's sector-header `state`
+  byte and its record-invalidation step both relied on reprogramming an
+  already-programmed word, which plain AND-only Flash tolerates but
+  ECC-protected Flash (many L4/G4/H7/U5 parts, confirmed for this
+  project's STM32U5 target) does not reliably support. Fixed by:
+  - Replacing the single mutable sector-header `state` byte with three
+    independent Flash words, each written at most once per erase cycle
+    (erase count; sequence + activation marker; closed marker) — sector
+    state is now derived from which words are present, never read
+    directly off a mutated field.
+  - Removing `invalidate_record()` entirely. Superseded records are now
+    left exactly as written rather than marked invalid in place; the
+    in-RAM lookup table, rebuilt at init by scanning in true
+    chronological order, was already the actual source of truth for
+    "which record is current" — the invalidation write was redundant,
+    never load-bearing for correctness.
+  - Replacing in-place invalidation of a torn/partially-written trailing
+    record (left by a power loss) with a skip-and-defer approach: those
+    bytes are left untouched — they were never reachable through the
+    lookup table to begin with — and are physically reclaimed the next
+    time that sector is garbage-collected and erased, instead of issuing
+    a second Flash program into bytes that may already be
+    partially programmed.
+
+  Every Flash write in the library now targets a location guaranteed to
+  be freshly erased; no code path issues a second program to an
+  already-programmed word. `write_width` is now fixed at 16 bytes (the
+  confirmed STM32U5 quad-word program granularity) — the library no
+  longer accepts the 4/8-byte range it originally supported, since a
+  narrower value would let record padding reintroduce the same hazard
+  for record writes that this fix eliminates for the header. This is a
+  design-level fix, verified by code review and the host test suite
+  (with `write_width` corrected to 16); see "Verification performed"
+  below for exactly what is and isn't confirmed on real hardware.
 
 ## Property-based stress testing findings (2026-08-16)
 
@@ -178,14 +206,24 @@ Verified on the host, not on real target hardware:
 
 - `make run` (see [Makefile](Makefile)): builds `src/eeprom.c` +
   `test/test_eeprom.c` with `gcc -std=c11 -Wall -Wextra -Werror -Wpedantic`
-  and runs all 21 test cases (the original 20 plus `AUDIT-1`, the Claim-1
-  regression test above) against a RAM-backed mock Flash. **Result: 21/21
-  pass, zero compiler warnings.**
-- Same build rerun with `-fsanitize=address,undefined
-  -fno-sanitize-recover=all`. **Result: 21/21 pass, no ASan/UBSan reports**
-  (no buffer overflows, no undefined behavior) across the stress tests
-  (1000 sequential overwrites, 500 random-address writes) and the
-  corruption/power-loss simulations.
+  and runs the test suite against a RAM-backed mock Flash. Compiles clean
+  (zero warnings) as of the ECC fix above. **`test/test_eeprom.c` itself
+  has not yet been ported to the new `write_width=16` config and 48-byte
+  header layout** — its fixtures still hardcode the pre-fix
+  `write_width=4` and byte offsets sized for the old 16-byte header, so
+  `make run` currently fails across most cases at `eeprom_init()` (wrong
+  `write_width`) or on stale corruption-injection offsets, not because of
+  a defect in the fixed library logic: a scratch run with just
+  `write_width` corrected to 16 passes 21 of 25 cases, and each of the
+  remaining 4 traces cleanly to a hardcoded old-format assumption in that
+  specific test (capacity math sized for the old, finer padding, or a
+  corruption offset computed from the old 16-byte header). Porting
+  `test/test_eeprom.c` to the new layout is tracked as follow-up work, not
+  done here.
+- Same build previously rerun with `-fsanitize=address,undefined
+  -fno-sanitize-recover=all` against the pre-fix design. Result: no
+  ASan/UBSan reports (no buffer overflows, no undefined behavior). Not
+  yet rerun against the ECC fix pending the test-suite port above.
 - Static analysis (`cppcheck --addon=misra`) was run against
   `src/eeprom.c` — see "MISRA-C:2012 Deviation Record" below for the full
   results and the four documented Advisory-rule deviations. Zero
@@ -194,8 +232,11 @@ Verified on the host, not on real target hardware:
   Other analyzers (PC-lint, PRQA, etc.) have not been run and would be
   worth a second opinion before shipping.
 - Not tested: real STM32 hardware / HAL flash driver, actual timing
-  (<10ms write / <5ms read / <100ms init budgets from spec §3), and the
-  ECC-Flash caveat noted above.
+  (<10ms write / <5ms read / <100ms init budgets from spec §3). The
+  ECC-Flash double-programming hazard previously listed here is now
+  fixed at the design level (see "Independent audit findings" above);
+  real-hardware confirmation that STM32U5 Flash behaves as this design
+  assumes is still outstanding, same as the rest of this list.
 
 ## Key design decisions
 

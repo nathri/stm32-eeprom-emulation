@@ -4,26 +4,63 @@
  *
  * On-disk layout
  * ---------------
- * Each managed Flash sector begins with a fixed-size, write-width-aligned
- * header, followed by a log of variable-length records:
+ * Each managed Flash sector begins with a fixed-size header, followed by
+ * a log of variable-length records:
  *
- *   Sector header (SECTOR_HEADER_SIZE = 16 bytes):
- *     offset 0..3   sequence     uint32_t, little-endian, assigned when the
- *                                sector is promoted to ACTIVE, monotonically
- *                                increasing across the library's lifetime.
- *     offset 4      state        uint8_t: 0xFF=EMPTY, 0xFE=ACTIVE, 0xFC=FULL.
- *                                Encoded so every transition only clears
- *                                bits (EMPTY -> ACTIVE -> FULL), which is
- *                                achievable with a single Flash program
- *                                operation and no erase.
- *     offset 5..7   reserved     0xFF.
- *     offset 8..11  erase_count  uint32_t, little-endian, lifetime erase
- *                                count for this physical sector.
- *     offset 12..15 reserved     0xFF.
+ *   Sector header (SECTOR_HEADER_SIZE = 48 bytes = 3 * 16-byte Flash
+ *   program words). STM32U5's ECC-protected Flash requires a program
+ *   granularity of 16 bytes (a "quad-word") and does not reliably support
+ *   a second program operation to an already-programmed word, even one
+ *   that only clears further bits - so unlike a plain AND-only-write
+ *   Flash part, this header cannot be built from one field that gets
+ *   mutated in place across a sector's EMPTY -> ACTIVE -> FULL lifetime.
+ *   Instead, each stage of that lifecycle gets its own dedicated 16-byte
+ *   word, written at most once between erases; the sector's effective
+ *   state is derived from which words have been written (see
+ *   derive_sector_state()), never read directly off a single byte:
+ *
+ *     word 0 (offset 0,  ERASE_COUNT):
+ *       bytes 0..3   erase_count  uint32_t LE, lifetime erase count for
+ *                                 this physical sector. Written once, by
+ *                                 persist_sector_erase_count(), immediately
+ *                                 after the sector is erased.
+ *       bytes 4..15  reserved     0xFF.
+ *
+ *     word 1 (offset 16, SEQUENCE + ACTIVATION_MARKER):
+ *       bytes 0..3   sequence     uint32_t LE, assigned when the sector is
+ *                                 claimed as ACTIVE or GC_DEST, monotonically
+ *                                 increasing across the library's lifetime.
+ *       byte  4      marker       uint8_t: 0xFE=ACTIVE, 0xFD=GC_DEST.
+ *                                 ACTIVE and GC_DEST are mutually exclusive
+ *                                 per erase cycle, so they safely share this
+ *                                 field without ever both being written to
+ *                                 it. Both bytes are written together, by
+ *                                 write_sector_activation(), in one Flash
+ *                                 program operation.
+ *       bytes 5..15  reserved     0xFF.
+ *
+ *     word 2 (offset 32, CLOSED_MARKER):
+ *       byte  0      marker       uint8_t: 0xFC=FULL. Written once, by
+ *                                 write_sector_closed_marker(), only for a
+ *                                 sector that was ACTIVE, when it's retired
+ *                                 or a torn trailing write is recovered
+ *                                 from (see finalize_torn_sector()).
+ *                                 Sectors claimed as GC_DEST never get this
+ *                                 word written - they're already reclaimable
+ *                                 as GC_DEST directly.
+ *       bytes 1..15  reserved     0xFF.
+ *
+ *   All-erased (0xFF throughout) reads as EMPTY. See derive_sector_state()
+ *   for the full state derivation, including DERIVED_STATE_TORN for a
+ *   sequence/marker combination that can only arise from a crash between
+ *   the two halves of one write_sector_activation() call - handled by the
+ *   same "corrupt header, force erase" recovery path as any other
+ *   inconsistent header (see scan_all_sectors()).
  *
  *   Record (RECORD_HEADER_SIZE = 4 byte header + data + 2 byte CRC16,
  *   padded with 0xFF to a write_width boundary):
- *     offset 0      status       0xFF = valid, 0x00 = invalidated/deleted.
+ *     offset 0      status       0xFF = valid. (Never written to any other
+ *                                value - see below.)
  *     offset 1..2   addr         uint16_t, little-endian, virtual address
  *                                (extended from the 1-byte field described
  *                                in the spec's example table, since this
@@ -39,11 +76,18 @@
  * The record's on-flash location is never reused: a value at a given
  * virtual address is always addressed by the *newest* record for that
  * address, tracked in a RAM lookup table indexed directly by virtual
- * address (`g_lookup`). Superseded records are best-effort invalidated in
- * place (status byte cleared to 0x00) but this is not load-bearing for
- * correctness - the lookup table, rebuilt at init purely by scanning
- * records in flash order, is always the source of truth for "which record
- * is current" (see scan_sector_records() and compact_sector()).
+ * address (`g_lookup`). Superseded records are left exactly as written -
+ * this library never issues a second Flash program to a record's own
+ * bytes to mark it invalidated (a former "best-effort" step that was
+ * already documented as not load-bearing for correctness, and would
+ * itself be a repeated-program-to-the-same-word ECC violation). The
+ * lookup table, rebuilt at init purely by scanning records in flash order
+ * and keeping the last (i.e. newest) match per address, is the sole
+ * source of truth for "which record is current" (see
+ * scan_sector_records() and compact_sector()); a superseded record's
+ * unchanged 0xFF status byte plays no role in that determination, and its
+ * bytes are physically reclaimed the next time its sector is
+ * garbage-collected and erased.
  *
  * Sector free space is intentionally NOT persisted as a running write
  * pointer in the header: under the AND-only Flash write semantics this
@@ -66,12 +110,23 @@
 /* Private constants                                                      */
 /* --------------------------------------------------------------------- */
 
-#define SECTOR_HEADER_SIZE   ((uint32_t)16U)
+/* Fixed at 16 bytes: STM32U5's ECC-protected Flash program granularity
+ * (a "quad-word"). eeprom_init() only accepts write_width == 16 (see its
+ * validation below), so this and g_config.write_width always agree. */
+#define SECTOR_HEADER_WORD_SIZE ((uint32_t)16U)
+
+/* ERASE_COUNT | SEQUENCE+ACTIVATION_MARKER | CLOSED_MARKER - see this
+ * file's header comment and derive_sector_state() for the full layout. */
+#define SECTOR_HEADER_SIZE   (3U * SECTOR_HEADER_WORD_SIZE)
+
+#define SECTOR_HDR_OFF_ERASE_COUNT ((uint32_t)0U)
+#define SECTOR_HDR_OFF_ACTIVATION  (SECTOR_HEADER_WORD_SIZE)
+#define SECTOR_HDR_OFF_CLOSED      (2U * SECTOR_HEADER_WORD_SIZE)
 
 /* Aliases of the public EEPROM_SECTOR_STATE_* constants (inc/eeprom.h),
  * not a second definition - see that header for the value/rationale
- * (including why GC_DEST clears a bit independent of the ACTIVE/FULL
- * chain) and eeprom_get_stats() for where these become visible to
+ * (including why GC_DEST safely shares the ACTIVATION_MARKER field with
+ * ACTIVE) and eeprom_get_stats() for where these become visible to
  * callers via eeprom_stats_t.sector_state[]. */
 #define SECTOR_STATE_EMPTY   EEPROM_SECTOR_STATE_EMPTY
 #define SECTOR_STATE_ACTIVE  EEPROM_SECTOR_STATE_ACTIVE
@@ -91,8 +146,9 @@
 #define RECORD_CRC_SIZE      ((uint16_t)2U)
 #define RECORD_MAX_DATA_SIZE ((uint16_t)255U)
 /* RECORD_HEADER_SIZE + RECORD_MAX_DATA_SIZE + RECORD_CRC_SIZE, rounded up
- * to the largest supported write_width (8). */
-#define RECORD_MAX_PADDED_SIZE ((uint16_t)264U)
+ * to write_width (16, the STM32U5 quad-word program granularity - the
+ * only value eeprom_init() now accepts, see its validation below). */
+#define RECORD_MAX_PADDED_SIZE ((uint16_t)272U)
 
 #define RECORD_STATUS_VALID   ((uint8_t)0xFFU)
 #define RECORD_STATUS_INVALID ((uint8_t)0x00U)
@@ -230,10 +286,73 @@ static uint16_t record_padded_size(uint8_t size)
     return align_up_u16(raw, g_config.write_width);
 }
 
-static int read_sector_header(uint8_t sector_index, uint32_t *sequence,
-                               uint8_t *state, uint32_t *erase_count)
+/**
+ * Effective sector state, derived from which of the three header words
+ * (see this file's header comment) have been written - never read
+ * directly off a single mutable byte, since ECC-protected Flash doesn't
+ * reliably support rewriting one. DERIVED_STATE_TORN covers any
+ * combination that can't arise from normal operation, including a crash
+ * between the two halves of one write_sector_activation() call (sequence
+ * written, activation marker not yet written).
+ */
+typedef enum {
+    DERIVED_STATE_EMPTY,
+    DERIVED_STATE_ACTIVE,
+    DERIVED_STATE_GC_DEST,
+    DERIVED_STATE_FULL,
+    DERIVED_STATE_TORN
+} derived_sector_state_t;
+
+static derived_sector_state_t derive_sector_state(uint32_t sequence,
+                                                   uint8_t activation_marker,
+                                                   uint8_t closed_marker)
 {
-    uint8_t buf[16];
+    bool seq_set = (sequence != SEQUENCE_ERASED_MARK);
+    bool marker_unset = (activation_marker == SECTOR_STATE_EMPTY);
+    bool closed_unset = (closed_marker == SECTOR_STATE_EMPTY);
+
+    if ((!seq_set) && marker_unset && closed_unset) {
+        return DERIVED_STATE_EMPTY;
+    }
+    if (seq_set && (activation_marker == SECTOR_STATE_ACTIVE) && closed_unset) {
+        return DERIVED_STATE_ACTIVE;
+    }
+    if (seq_set && (activation_marker == SECTOR_STATE_ACTIVE) && (closed_marker == SECTOR_STATE_FULL)) {
+        return DERIVED_STATE_FULL;
+    }
+    if (seq_set && (activation_marker == SECTOR_STATE_GC_DEST) && closed_unset) {
+        return DERIVED_STATE_GC_DEST;
+    }
+    return DERIVED_STATE_TORN;
+}
+
+/* Maps a derived state to the public EEPROM_SECTOR_STATE_* byte used for
+ * g_sectors[].state and eeprom_stats_t.sector_state[]. Never called with
+ * DERIVED_STATE_TORN - scan_all_sectors() treats that as corrupt and
+ * force-erases the sector before this mapping would matter. */
+static uint8_t derived_state_to_byte(derived_sector_state_t derived)
+{
+    switch (derived) {
+        case DERIVED_STATE_ACTIVE:  return SECTOR_STATE_ACTIVE;
+        case DERIVED_STATE_GC_DEST: return SECTOR_STATE_GC_DEST;
+        case DERIVED_STATE_FULL:    return SECTOR_STATE_FULL;
+        case DERIVED_STATE_EMPTY:
+        default:                    return SECTOR_STATE_EMPTY;
+    }
+}
+
+/**
+ * Reads all three header words in one flash_read() (reads are
+ * unrestricted at any granularity - the ECC program-granularity
+ * constraint applies only to Flash writes), returning the raw sequence
+ * and marker bytes. Derivation is left to the caller via
+ * derive_sector_state().
+ */
+static int read_sector_header(uint8_t sector_index, uint32_t *sequence,
+                               uint8_t *activation_marker, uint8_t *closed_marker,
+                               uint32_t *erase_count)
+{
+    uint8_t buf[SECTOR_HEADER_SIZE];
     uint8_t attempt;
     int read_rc = -1;
 
@@ -255,29 +374,76 @@ static int read_sector_header(uint8_t sector_index, uint32_t *sequence,
     if (read_rc != 0) {
         return -1;
     }
-    *sequence = load_u32(&buf[0]);
-    *state = buf[4];
-    *erase_count = load_u32(&buf[8]);
+    *erase_count = load_u32(&buf[SECTOR_HDR_OFF_ERASE_COUNT]);
+    *sequence = load_u32(&buf[SECTOR_HDR_OFF_ACTIVATION]);
+    *activation_marker = buf[SECTOR_HDR_OFF_ACTIVATION + 4U];
+    *closed_marker = buf[SECTOR_HDR_OFF_CLOSED];
     return 0;
 }
 
-static int write_sector_header(uint8_t sector_index, uint32_t sequence,
-                                uint8_t state, uint32_t erase_count)
+/**
+ * Writes only the ERASE_COUNT word (see this file's header comment).
+ * Called once per erase cycle, immediately after flash_erase() - never
+ * rewritten again until the next erase.
+ */
+static int persist_sector_erase_count(uint8_t sector_index, uint32_t erase_count)
 {
-    uint8_t buf[16];
+    uint8_t buf[SECTOR_HEADER_WORD_SIZE];
+    uint8_t i;
+
+    store_u32(&buf[0], erase_count);
+    for (i = 4; i < SECTOR_HEADER_WORD_SIZE; i++) {
+        buf[i] = 0xFFU;
+    }
+    if (g_config.flash_write(get_sector_address(sector_index) + SECTOR_HDR_OFF_ERASE_COUNT,
+                              buf, (uint16_t)sizeof(buf)) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * Writes only the SEQUENCE + ACTIVATION_MARKER word, in one Flash program
+ * operation covering both values. marker_value must be SECTOR_STATE_ACTIVE
+ * or SECTOR_STATE_GC_DEST. Called once per erase cycle, when the sector is
+ * claimed - never rewritten again (the later FULL transition writes the
+ * separate CLOSED_MARKER word instead, via write_sector_closed_marker()).
+ */
+static int write_sector_activation(uint8_t sector_index, uint32_t sequence, uint8_t marker_value)
+{
+    uint8_t buf[SECTOR_HEADER_WORD_SIZE];
+    uint8_t i;
 
     store_u32(&buf[0], sequence);
-    buf[4] = state;
-    buf[5] = 0xFFU;
-    buf[6] = 0xFFU;
-    buf[7] = 0xFFU;
-    store_u32(&buf[8], erase_count);
-    buf[12] = 0xFFU;
-    buf[13] = 0xFFU;
-    buf[14] = 0xFFU;
-    buf[15] = 0xFFU;
+    buf[4] = marker_value;
+    for (i = 5; i < SECTOR_HEADER_WORD_SIZE; i++) {
+        buf[i] = 0xFFU;
+    }
+    if (g_config.flash_write(get_sector_address(sector_index) + SECTOR_HDR_OFF_ACTIVATION,
+                              buf, (uint16_t)sizeof(buf)) != 0) {
+        return -1;
+    }
+    return 0;
+}
 
-    if (g_config.flash_write(get_sector_address(sector_index), buf, (uint16_t)sizeof(buf)) != 0) {
+/**
+ * Writes only the CLOSED_MARKER word. Called once, only for a sector that
+ * was ACTIVE, either when it's retired for being full (ensure_room()) or
+ * when a torn trailing write is recovered from (finalize_torn_sector()).
+ * Sectors claimed as GC_DEST never get this written - see this file's
+ * header comment.
+ */
+static int write_sector_closed_marker(uint8_t sector_index)
+{
+    uint8_t buf[SECTOR_HEADER_WORD_SIZE];
+    uint8_t i;
+
+    buf[0] = SECTOR_STATE_FULL;
+    for (i = 1; i < SECTOR_HEADER_WORD_SIZE; i++) {
+        buf[i] = 0xFFU;
+    }
+    if (g_config.flash_write(get_sector_address(sector_index) + SECTOR_HDR_OFF_CLOSED,
+                              buf, (uint16_t)sizeof(buf)) != 0) {
         return -1;
     }
     return 0;
@@ -300,22 +466,18 @@ static int write_sector_header(uint8_t sector_index, uint32_t sequence,
  * wear-leveling health check built on it. Found via randomized-reboot
  * property-based stress testing.
  *
- * Deliberately passes SEQUENCE_ERASED_MARK for the sequence field rather
- * than 0: under this format's AND-only write semantics a byte can only
- * have bits cleared, never set, so writing 0 here would permanently trap
- * that field at 0 - a later activate_sector()/mark_gc_destination() call
- * would never be able to AND-narrow it back up to a real, non-zero
- * sequence number. SEQUENCE_ERASED_MARK (0xFFFFFFFF) is what the field
- * already reads as immediately after an erase, so writing it back is a
- * true no-op there, leaving it free for a later real value while still
- * durably recording erase_count. Best-effort (return value ignored) for
- * the same reason invalidate_record() is: on failure, behavior simply
+ * ECC redesign: writes only the dedicated ERASE_COUNT word, via
+ * persist_sector_erase_count() - never the SEQUENCE+ACTIVATION_MARKER
+ * word. Unlike the pre-redesign version (which rewrote a single shared
+ * header buffer and had to deliberately preserve the sequence field's
+ * erased-marker value to avoid permanently trapping it), those two fields
+ * no longer share a Flash word at all, so there's nothing to preserve
+ * here. Best-effort (return value ignored): on failure, behavior simply
  * reverts to the pre-fix state for this one sector, not a new regression.
  */
 static void persist_empty_sector_erase_count(uint8_t sector_index)
 {
-    (void)write_sector_header(sector_index, SEQUENCE_ERASED_MARK, SECTOR_STATE_EMPTY,
-                               g_sectors[sector_index].erase_count);
+    (void)persist_sector_erase_count(sector_index, g_sectors[sector_index].erase_count);
 }
 
 static int8_t find_empty_sector(void)
@@ -366,17 +528,17 @@ static int8_t find_gc_target_sector(void)
 
 /**
  * Promote an EMPTY sector to ACTIVE: assigns it the next sequence number,
- * persists the header, and resets its in-RAM write offset. This is the
- * ONLY function that ever writes SECTOR_STATE_ACTIVE - it must be used
- * exclusively for "the sector application writes now go to." A GC
- * compaction destination must use mark_gc_destination() instead, even
- * though the two functions are otherwise identical, precisely so that at
- * most one sector can ever read back as ACTIVE (see mark_gc_destination()).
+ * persists the SEQUENCE+ACTIVATION_MARKER word, and resets its in-RAM
+ * write offset. This is the ONLY function that ever writes
+ * SECTOR_STATE_ACTIVE - it must be used exclusively for "the sector
+ * application writes now go to." A GC compaction destination must use
+ * mark_gc_destination() instead, even though the two functions are
+ * otherwise identical, precisely so that at most one sector can ever read
+ * back as ACTIVE (see mark_gc_destination()).
  */
 static eeprom_status_t activate_sector(uint8_t sector_index)
 {
-    if (write_sector_header(sector_index, g_next_sequence, SECTOR_STATE_ACTIVE,
-                             g_sectors[sector_index].erase_count) != 0) {
+    if (write_sector_activation(sector_index, g_next_sequence, SECTOR_STATE_ACTIVE) != 0) {
         return EEPROM_WRITE_FAILED;
     }
     g_sectors[sector_index].sequence = g_next_sequence;
@@ -401,8 +563,7 @@ static eeprom_status_t activate_sector(uint8_t sector_index)
  */
 static eeprom_status_t mark_gc_destination(uint8_t sector_index)
 {
-    if (write_sector_header(sector_index, g_next_sequence, SECTOR_STATE_GC_DEST,
-                             g_sectors[sector_index].erase_count) != 0) {
+    if (write_sector_activation(sector_index, g_next_sequence, SECTOR_STATE_GC_DEST) != 0) {
         return EEPROM_WRITE_FAILED;
     }
     g_sectors[sector_index].sequence = g_next_sequence;
@@ -482,24 +643,6 @@ static eeprom_status_t validate_record(uint32_t flash_addr, uint16_t *data_size)
     return EEPROM_OK;
 }
 
-/**
- * Best-effort invalidation: clears the status byte of the record at
- * flash_addr to RECORD_STATUS_INVALID via a single write_width-aligned
- * Flash write (safe under AND-only write semantics; a failure here is not
- * fatal, see the file-level comment on lookup-table authority).
- */
-static void invalidate_record(uint32_t flash_addr)
-{
-    uint8_t buf[8];
-    uint8_t i;
-
-    buf[0] = RECORD_STATUS_INVALID;
-    for (i = 1; i < g_config.write_width; i++) {
-        buf[i] = 0xFFU;
-    }
-    (void)g_config.flash_write(flash_addr, buf, g_config.write_width);
-}
-
 static eeprom_status_t ensure_room(uint16_t rec_total)
 {
     uint32_t free_space;
@@ -516,8 +659,7 @@ static eeprom_status_t ensure_room(uint16_t rec_total)
     }
 
     /* Retire the current active sector. */
-    if (write_sector_header((uint8_t)g_active_sector, g_sectors[(uint8_t)g_active_sector].sequence,
-                             SECTOR_STATE_FULL, g_sectors[(uint8_t)g_active_sector].erase_count) != 0) {
+    if (write_sector_closed_marker((uint8_t)g_active_sector) != 0) {
         return EEPROM_WRITE_FAILED;
     }
     g_sectors[(uint8_t)g_active_sector].state = SECTOR_STATE_FULL;
@@ -709,7 +851,6 @@ static eeprom_status_t write_record(uint16_t addr, const uint8_t *data, uint8_t 
     uint8_t *buf = g_write_record_buf;
     uint16_t rec_total = record_padded_size(size);
     uint16_t crc;
-    uint32_t old_loc;
     uint32_t new_loc;
     uint16_t i;
     eeprom_status_t rc;
@@ -743,10 +884,11 @@ static eeprom_status_t write_record(uint16_t addr, const uint8_t *data, uint8_t 
         return EEPROM_WRITE_FAILED;
     }
 
-    old_loc = g_lookup[addr];
-    if (old_loc != LOOKUP_EMPTY) {
-        invalidate_record(old_loc);
-    }
+    /* The previous record for addr, if any, is left exactly as written -
+     * no invalidation write. It's already unreachable the moment
+     * g_lookup[addr] below is repointed at new_loc, and its bytes are
+     * physically reclaimed the next time its sector is garbage-collected
+     * and erased. See this file's header comment. */
     g_lookup[addr] = new_loc;
     g_sectors[(uint8_t)g_active_sector].write_offset += rec_total;
     g_stats.sector_usage[(uint8_t)g_active_sector] = g_sectors[(uint8_t)g_active_sector].write_offset;
@@ -759,16 +901,27 @@ static eeprom_status_t write_record(uint16_t addr, const uint8_t *data, uint8_t 
 /* --------------------------------------------------------------------- */
 
 /**
- * Recovers from a partial write left behind by a power loss: invalidates
- * the broken trailing record (best effort) and permanently retires the
- * sector by transitioning it to FULL, since bytes past a broken record
- * cannot be trusted or safely reclaimed without a full erase.
+ * Handles a torn/undecodable trailing record left by a power loss while
+ * writing to sector_index. No Flash write to the torn record's own bytes
+ * is needed: scan_sector_records() never links a structurally-invalid
+ * record into g_lookup (see the broken_tail paths below), so it's already
+ * unreachable via the normal read path, whatever bytes are sitting there.
+ * It is physically reclaimed by the ordinary GC/erase cycle once this
+ * sector closes here - no separate cleanup needed. Permanently retires
+ * the sector by transitioning it to FULL, since bytes past a broken
+ * record cannot be trusted or safely reclaimed without a full erase.
+ *
+ * Idempotent: the caller in scan_sector_records() already only invokes
+ * this while the sector's state is still ACTIVE, so in practice this is a
+ * single-shot call per sector; the state check here is a cheap second
+ * guard given how strict the at-most-once-per-word rule is.
  */
-static void recover_partial_sector(uint8_t sector_index, uint32_t offset)
+static void finalize_torn_sector(uint8_t sector_index)
 {
-    invalidate_record(get_sector_address(sector_index) + offset);
-    (void)write_sector_header(sector_index, g_sectors[sector_index].sequence,
-                               SECTOR_STATE_FULL, g_sectors[sector_index].erase_count);
+    if (g_sectors[sector_index].state == SECTOR_STATE_FULL) {
+        return;
+    }
+    (void)write_sector_closed_marker(sector_index);
     g_sectors[sector_index].state = SECTOR_STATE_FULL;
 }
 
@@ -800,15 +953,13 @@ static void scan_sector_records(uint8_t sector_index)
             /* Every attempt faulted - audit fix: an earlier version gave
              * up after one flash_read() failure here and treated it
              * exactly like a genuinely truncated sector tail, which (for
-             * an ACTIVE sector) drove recover_partial_sector() to
-             * PERMANENTLY invalidate whatever record was actually at
-             * this offset via a real Flash write - destroying data that,
-             * per this file's own READ_FAILED semantics, may never have
-             * been corrupted at all, only transiently unreadable on that
-             * one attempt (found by property-based stress testing that
-             * injected standalone random read failures with no data
-             * corruption whatsoever and still lost previously-committed
-             * records). Still treated as
+             * an ACTIVE sector) drove the torn-record recovery path to
+             * PERMANENTLY retire the sector based on what may have been a
+             * transient read glitch rather than real corruption, per this
+             * file's own READ_FAILED semantics (found by property-based
+             * stress testing that injected standalone random read
+             * failures with no data corruption whatsoever and still lost
+             * previously-committed records). Still treated as
              * broken_tail after exhausting retries: at that point a
              * genuinely undecodable header is the most defensible
              * remaining assumption. */
@@ -838,22 +989,23 @@ static void scan_sector_records(uint8_t sector_index)
                  * sector) - this, and only this, is the case where we
                  * genuinely cannot know how many bytes to skip to find
                  * the next record, so it's the one legitimate reason to
-                 * stop scanning here (see recover_partial_sector() for
+                 * stop scanning here (see finalize_torn_sector() for
                  * ACTIVE sectors below). */
                 broken_tail = true;
                 break;
             }
 
             /* A structurally decodable header (addr/size in range, fits
-             * the sector) whose status byte is neither VALID nor INVALID
-             * means THIS record's own bytes were corrupted after being
-             * fully committed - e.g. a single bit flip applied post-write
+             * the sector) whose status byte is not VALID (0xFF) means
+             * THIS record's own bytes were corrupted after being fully
+             * committed - e.g. a single bit flip applied post-write
              * (found by property-based stress testing) - not that the
-             * sector's tail was cut off by a power loss. Its length is
-             * still trustworthy,
-             * so unlike the undecodable case above, it's both safe AND
-             * necessary to skip over it (like an explicitly
-             * RECORD_STATUS_INVALID record already is) and keep
+             * sector's tail was cut off by a power loss. (This library no
+             * longer ever intentionally writes a non-VALID status byte -
+             * see this file's header comment - so any such byte seen here
+             * is corruption, not a superseded record.) Its length is
+             * still trustworthy, so unlike the undecodable case above,
+             * it's both safe AND necessary to skip over it and keep
              * scanning, rather than stopping.
              *
              * Audit fix: this used to be folded into the same
@@ -876,17 +1028,18 @@ static void scan_sector_records(uint8_t sector_index)
 
     g_sectors[sector_index].write_offset = cur;
     if (broken_tail && (g_sectors[sector_index].state == SECTOR_STATE_ACTIVE)) {
-        recover_partial_sector(sector_index, cur);
+        finalize_torn_sector(sector_index);
     }
 }
 
 /**
  * Reads and classifies every sector's header. A header is treated as
- * corrupt if its state byte is not one of EMPTY/ACTIVE/FULL, or if it
- * claims a non-EMPTY state while its sequence number still reads as the
- * erased marker (an inconsistent combination that cannot arise from
- * normal operation). Corrupt sectors are erased immediately and marked
- * EMPTY, per the spec's documented recovery strategy.
+ * corrupt if derive_sector_state() can't map its sequence/marker words to
+ * one of EMPTY/ACTIVE/GC_DEST/FULL (DERIVED_STATE_TORN) - which covers
+ * both a header that could never arise from normal operation and a crash
+ * between the two halves of one write_sector_activation() call. Corrupt
+ * sectors are erased immediately and marked EMPTY, per the spec's
+ * documented recovery strategy.
  */
 static void scan_all_sectors(void)
 {
@@ -894,19 +1047,17 @@ static void scan_all_sectors(void)
 
     for (i = 0; i < g_config.num_sectors; i++) {
         uint32_t seq = 0;
-        uint8_t state = SECTOR_STATE_EMPTY;
+        uint8_t activation_marker = SECTOR_STATE_EMPTY;
+        uint8_t closed_marker = SECTOR_STATE_EMPTY;
         uint32_t erase_cnt = 0;
+        derived_sector_state_t derived = DERIVED_STATE_TORN;
         bool corrupt;
 
-        if (read_sector_header(i, &seq, &state, &erase_cnt) != 0) {
-            corrupt = true;
-        } else if ((state != SECTOR_STATE_EMPTY) && (state != SECTOR_STATE_ACTIVE) &&
-                   (state != SECTOR_STATE_FULL) && (state != SECTOR_STATE_GC_DEST)) {
-            corrupt = true;
-        } else if ((state != SECTOR_STATE_EMPTY) && (seq == SEQUENCE_ERASED_MARK)) {
+        if (read_sector_header(i, &seq, &activation_marker, &closed_marker, &erase_cnt) != 0) {
             corrupt = true;
         } else {
-            corrupt = false;
+            derived = derive_sector_state(seq, activation_marker, closed_marker);
+            corrupt = (derived == DERIVED_STATE_TORN);
         }
 
         if (corrupt) {
@@ -918,7 +1069,7 @@ static void scan_all_sectors(void)
             persist_empty_sector_erase_count(i);
         } else {
             g_sectors[i].sequence = seq;
-            g_sectors[i].state = state;
+            g_sectors[i].state = derived_state_to_byte(derived);
             /* A sector whose header has never been written (blank/erased
              * silicon, or freshly erased by us) reads erase_count back as
              * the erased marker, not a real count - treat that as 0 rather
@@ -940,14 +1091,14 @@ static void scan_all_sectors(void)
  * index order coincides with activation order only up until the first
  * time a low-indexed sector is reused after a later-indexed one is
  * already active - which happens routinely once wear-leveling rotation
- * wraps around. In the normal case this is masked by invalidate_record()
- * correctly clearing stale records' status bytes, but a record whose
- * invalidation write itself failed (a real Flash fault) followed by a
- * reboot before the next GC cleans it up would, under index-order
- * scanning, have a chance of incorrectly winning over a genuinely newer
- * record living in a lower-indexed sector. Sequence order removes that
- * dependency on invalidate_record() succeeding. O(n^2) in num_sectors
- * (<=8), negligible.
+ * wraps around. Under index-order scanning, a stale record physically
+ * living in a lower-indexed sector would have a chance of incorrectly
+ * winning over a genuinely newer record in a higher-indexed sector, since
+ * this library never marks a superseded record invalid on flash at all
+ * (see this file's header comment) - "last one scanned wins" only
+ * reproduces "latest write wins" if the scan itself visits sectors in
+ * true chronological order. Sequence order guarantees that, independent
+ * of physical layout. O(n^2) in num_sectors (<=8), negligible.
  */
 static void scan_records_in_activation_order(void)
 {
@@ -994,10 +1145,20 @@ eeprom_status_t eeprom_init(const eeprom_config_t *config)
     int8_t chosen_active = -1;
     eeprom_status_t rc;
 
+    /* write_width must be exactly SECTOR_HEADER_WORD_SIZE (16): STM32U5's
+     * ECC-protected Flash requires 16-byte quad-word programming, and the
+     * sector-header layout (see this file's header comment) hardcodes that
+     * same 16-byte word size for its ERASE_COUNT/SEQUENCE+ACTIVATION_MARKER/
+     * CLOSED_MARKER fields. Accepting a smaller write_width here would let
+     * record padding round to a boundary narrower than what the real Flash
+     * requires, silently reintroducing the same repeated-program-to-an-
+     * already-programmed-word hazard this design exists to eliminate - just
+     * for record writes instead of the header. This library no longer
+     * supports the 4/8-byte range it originally did. */
     if ((config == NULL) || (config->flash_read == NULL) || (config->flash_write == NULL) ||
         (config->flash_erase == NULL) || (config->sector_size == 0U) ||
         (config->num_sectors < 2U) || (config->num_sectors > EEPROM_MAX_SECTORS) ||
-        ((config->write_width != 4U) && (config->write_width != 8U))) {
+        (config->write_width != (uint8_t)SECTOR_HEADER_WORD_SIZE)) {
         return EEPROM_FORMAT_ERROR;
     }
 

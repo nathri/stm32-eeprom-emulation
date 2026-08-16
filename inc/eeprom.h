@@ -78,14 +78,19 @@ typedef enum {
  * @brief Platform configuration and Flash driver callbacks.
  *
  * All three callbacks must return 0 on success and a non-zero value on
- * failure. flash_write() is only ever called on addresses that are either
- * freshly erased or being narrowed (bits cleared, never set) by the caller.
+ * failure. flash_write() is only ever called on freshly-erased Flash -
+ * this library never issues a second program operation to an
+ * already-programmed word (STM32U5's ECC-protected Flash does not
+ * reliably support that, even to only clear further bits).
  */
 typedef struct {
     uint32_t flash_start;   /**< Base address of the first EEPROM-emulation sector. */
     uint32_t sector_size;   /**< Size of each sector in bytes (identical for all sectors). */
     uint8_t  num_sectors;   /**< Number of sectors to manage (2-EEPROM_MAX_SECTORS). */
-    uint8_t  write_width;   /**< Flash program granularity in bytes (4 or 8). */
+    uint8_t  write_width;   /**< Flash program granularity in bytes. Must be 16 - the
+                                  STM32U5 ECC-protected Flash quad-word granularity; this
+                                  library no longer supports the 4/8-byte range it
+                                  originally did (see eeprom_init()'s validation). */
 
     /** Read @p size bytes from Flash at @p addr into @p data. Returns 0 on success. */
     int (*flash_read)(uint32_t addr, uint8_t *data, uint16_t size);
@@ -100,21 +105,34 @@ typedef struct {
 /**
  * @brief Per-sector state byte values reported via
  * eeprom_stats_t.sector_state[]. This IS eeprom.c's own internal on-flash
- * state encoding (not a separate diagnostics-only numbering) - eeprom.c's
- * private SECTOR_STATE_* constants are aliases of these, not a second
- * definition, so the two can never drift apart.
+ * marker-byte encoding (not a separate diagnostics-only numbering) -
+ * eeprom.c's private SECTOR_STATE_* constants are aliases of these, not a
+ * second definition, so the two can never drift apart.
+ *
+ * On flash, these values are no longer written into one shared,
+ * repeatedly-rewritten "state" byte (STM32U5's ECC-protected Flash does
+ * not reliably support programming an already-programmed word a second
+ * time, even to only clear further bits). Each value below is instead
+ * written at most once, into its own dedicated Flash word, by
+ * eeprom.c's write_sector_activation() (ACTIVE/GC_DEST) or
+ * write_sector_closed_marker() (FULL); the effective sector state is
+ * derived from which markers are present by derive_sector_state(). See
+ * eeprom.c's file header comment for the full on-disk layout.
  */
 #define EEPROM_SECTOR_STATE_EMPTY    ((uint8_t)0xFFU) /**< Erased; not currently in use. */
 #define EEPROM_SECTOR_STATE_ACTIVE   ((uint8_t)0xFEU) /**< Currently receiving new writes. */
 #define EEPROM_SECTOR_STATE_FULL     ((uint8_t)0xFCU) /**< Full; awaiting garbage collection. */
 /* Destination of an in-progress/completed garbage-collection compaction.
- * Reachable from EMPTY by clearing bit 1 only - independent of the
- * ACTIVE(clears bit0)/FULL(clears bit0+bit1) chain, so it can never be
- * confused with "the sector real application writes go to" regardless of
- * physical sector index or sequence number. Without that distinction, a
- * manually-triggered GC that promotes a spare sector and is then
- * interrupted by a power loss could leave TWO sectors reading as ACTIVE,
- * with eeprom_init() having no way to tell which one is real. */
+ * ACTIVE and GC_DEST are mutually exclusive per erase cycle (a sector is
+ * claimed as at most one of the two - see write_sector_activation()), so
+ * they safely share the same on-flash marker field/word without ever
+ * both being written to it. Kept as a value distinct from ACTIVE so a GC
+ * destination can never be confused with "the sector real application
+ * writes go to" regardless of physical sector index or sequence number:
+ * without that distinction, a manually-triggered GC that promotes a
+ * spare sector and is then interrupted by a power loss could leave TWO
+ * sectors reading as ACTIVE, with eeprom_init() having no way to tell
+ * which one is real. */
 #define EEPROM_SECTOR_STATE_GC_DEST  ((uint8_t)0xFDU)
 
 /**
