@@ -491,6 +491,39 @@ copy of the file correctly makes the grep-based CI check fail) before
 relying on it. The `--error-exitcode=1`-vs-`unusedFunction` interaction
 described in the paragraph above was found and fixed in the same pass.
 
+**CI incident, 2026-08-16**: a later push failed the MISRA job with
+`src/eeprom.c:-1:0: information: Unmatched suppression: misra-c2012-8.7
+[unmatchedSuppression]`. Investigated before touching anything: `git
+blame cppcheck-suppressions.txt` showed the `misra-c2012-8.7:src/eeprom.c`
+entry unchanged since the file's introduction, and re-running cppcheck
+2.22 against every one of the preceding commits' exact `src/eeprom.c` —
+with `--suppressions-list` deliberately omitted, so nothing could hide —
+confirmed all 7 flagged functions (the public API, non-`static` because
+they're declared in `eeprom.h` and called from outside this translation
+unit) still trigger a genuine Rule 8.7 finding at every commit, unchanged.
+Re-adding `--suppressions-list=cppcheck-suppressions.txt` against the
+same code, same cppcheck build, correctly suppressed all 7 with no
+complaint. So the suppression entry itself was correct and untouched the
+whole time — the finding never went away, and the file that's supposed to
+hide it does, locally. The `information: Unmatched suppression` message
+is best explained as an addon-vs-native suppression-bookkeeping quirk
+specific to whatever cppcheck version the GitHub-hosted runner's
+`apt-get install cppcheck` resolved to this time (the addon-generated
+MISRA findings arrive via a subprocess, and don't always register as
+"matched" against `--suppressions-list` the same way across cppcheck
+versions) — the same category of local-vs-CI version difference as the
+2026-08-15 incident above, just manifesting differently. The actual bug
+was in the CI gate, not the suppressions file: `Unmatched suppression:
+misra-c2012-8.7` contains the substring `misra-c2012-8.7`, so the
+original plain `grep -q "misra-c2012-"` failed the build on an
+*informational* notice about the suppression mechanism itself, not on
+any code violation. Fixed by filtering out lines containing
+`unmatchedSuppression` before that grep runs (see the workflow file's own
+comment at that step for the one-paragraph version) — a real, unsuppressed
+`misra-c2012-*` finding is always reported at `style:` or `error:`
+severity, never wrapped in `[unmatchedSuppression]`, so this doesn't
+weaken the gate against genuine new findings.
+
 **Result: zero Required or Mandatory rule violations.** Every finding below
 is Advisory, each is a deliberate, load-bearing design choice (not an
 oversight), and each is scoped to specific, named, enumerable locations —

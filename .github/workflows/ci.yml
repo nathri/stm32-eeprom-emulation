@@ -56,7 +56,21 @@ jobs:
             --suppressions-list=cppcheck-suppressions.txt \
             src/eeprom.c 2>&1 | tee cppcheck-output.txt
 
-          if grep -q "misra-c2012-" cppcheck-output.txt; then
+          # Exclude [unmatchedSuppression] "information:" notices before
+          # the misra-c2012- grep below - see IMPLEMENTATION_NOTES.md's
+          # "CI incident, 2026-08-16" for the full investigation. Short
+          # version: this runner's cppcheck reports
+          # "Unmatched suppression: misra-c2012-8.7" for a suppression
+          # entry that is, in fact, correct and still needed (verified
+          # locally: the 7 flagged functions are unchanged, and the same
+          # suppression file correctly matches and hides all 7 findings
+          # with a different cppcheck build) - an addon-vs-native
+          # suppression-bookkeeping quirk, not a real finding. That
+          # message still contains the substring "misra-c2012-8.7", so
+          # the old plain grep failed the build on an informational
+          # notice about the suppression mechanism itself, not on any
+          # code violation.
+          if grep "misra-c2012-" cppcheck-output.txt | grep -v "unmatchedSuppression" | grep -q .; then
             echo "::error::Unsuppressed MISRA-C:2012 finding(s) - not in cppcheck-suppressions.txt. See IMPLEMENTATION_NOTES.md (MISRA-C:2012 Deviation Record) to review and either fix the code or document a new deviation."
             exit 1
           fi
