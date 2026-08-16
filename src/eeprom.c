@@ -547,28 +547,59 @@ static eeprom_status_t compact_sector(uint8_t src, uint8_t dst)
         size = hdr[3];
         rec_total = record_padded_size(size);
 
-        if ((hdr[0] == RECORD_STATUS_VALID) && (g_lookup[addr] == rec_loc)) {
-            uint16_t chk_size;
+        if ((addr <= EEPROM_MAX_VIRTUAL_ADDR) && (g_lookup[addr] == rec_loc)) {
+            /* Deliberately keyed on g_lookup alone, not this record's own
+             * status byte: g_lookup is this file's documented source of
+             * truth for "which record is current" (see the file-level
+             * doc comment), so if it already says addr's live record is
+             * at rec_loc, that stands regardless of what rec_loc's own
+             * header currently reads - migrate it. The addr bound check
+             * is not a stand-in for that removed status check; it is a
+             * separate, mandatory precondition for the g_lookup[addr]
+             * access itself, since addr is loaded directly from this
+             * record's (possibly corrupted or torn) header bytes.
+             * Audit fix: this used to also require
+             * hdr[0] == RECORD_STATUS_VALID, so a record whose status
+             * byte alone got corrupted (e.g. a single bit flip - found
+             * by property-based, randomized-fault stress testing) was
+             * silently skipped here even though g_lookup still
+             * correctly pointed at it, with the
+             * same downstream consequence as the CRC case below: once
+             * its source sector was erased, the address became
+             * unrecoverable and a later eeprom_init() reported
+             * EEPROM_NOT_FOUND for data that was, in fact, written.
+             *
+             * Migrating unconditionally (not gated on validate_record()
+             * either) is the other half of this fix: GC's job is to
+             * preserve the current record for its address, not to
+             * eagerly judge its data integrity - that is deferred to
+             * eeprom_read()'s lazy CRC check everywhere else in this
+             * file (see validate_record()'s own doc comment on that
+             * split). An earlier version only migrated a record here if
+             * validate_record() reported EEPROM_OK, silently dropping
+             * any record whose CRC no longer matched with the identical
+             * NOT_FOUND-after-erase consequence. Migrating the bytes
+             * as-is (corruption included) instead preserves the honest
+             * EEPROM_CHECKSUM_ERROR a read would already have reported
+             * before this GC ran.
+             */
+            uint32_t dst_free = g_config.sector_size - g_sectors[dst].write_offset;
 
-            if (validate_record(rec_loc, &chk_size) == EEPROM_OK) {
-                uint32_t dst_free = g_config.sector_size - g_sectors[dst].write_offset;
+            if (dst_free < (uint32_t)rec_total) {
+                return EEPROM_SECTOR_FULL;
+            }
+            if (g_config.flash_read(rec_loc, buf, rec_total) != 0) {
+                return EEPROM_WRITE_FAILED;
+            }
+            {
+                uint32_t dst_loc = get_sector_address(dst) + g_sectors[dst].write_offset;
 
-                if (dst_free < (uint32_t)rec_total) {
-                    return EEPROM_SECTOR_FULL;
-                }
-                if (g_config.flash_read(rec_loc, buf, rec_total) != 0) {
+                if (g_config.flash_write(dst_loc, buf, rec_total) != 0) {
                     return EEPROM_WRITE_FAILED;
                 }
-                {
-                    uint32_t dst_loc = get_sector_address(dst) + g_sectors[dst].write_offset;
-
-                    if (g_config.flash_write(dst_loc, buf, rec_total) != 0) {
-                        return EEPROM_WRITE_FAILED;
-                    }
-                    g_lookup[addr] = dst_loc;
-                    g_sectors[dst].write_offset += rec_total;
-                    g_stats.sector_usage[dst] = g_sectors[dst].write_offset;
-                }
+                g_lookup[addr] = dst_loc;
+                g_sectors[dst].write_offset += rec_total;
+                g_stats.sector_usage[dst] = g_sectors[dst].write_offset;
             }
         }
         cur += rec_total;

@@ -1005,6 +1005,84 @@ static bool tc_audit_erase_count_persists_empty_sector(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* AUDIT-3: GC must preserve, not drop, a record whose status byte or CRC */
+/* no longer validates (regression test for a bug found by property-based */
+/* stress testing)                                                        */
+/* --------------------------------------------------------------------- */
+
+static bool tc_audit_gc_preserves_corrupted_record(void)
+{
+    /* compact_sector() used to only migrate a record forward during GC if
+     * BOTH its status byte still read RECORD_STATUS_VALID AND its CRC
+     * validated - silently dropping (no migration, g_lookup left pointing
+     * at soon-to-be-erased flash) any record that failed either check,
+     * e.g. after a single bit flip applied post-commit. Once the source
+     * sector was erased, that address became permanently unrecoverable: a
+     * later eeprom_read() reported EEPROM_NOT_FOUND for data that had, in
+     * fact, been successfully written - silently misrepresenting
+     * corruption as "never written."
+     *
+     * This corrupts a freshly-written record's status byte directly
+     * (simulating a bit-corruption fault applied post-commit, the way
+     * the property-based stress harness that found this does), then
+     * drives enough
+     * further writes - to OTHER addresses, so this record is never itself
+     * superseded - to force the sector holding it to be reclaimed by GC
+     * while it is still the "current" record for its address per
+     * g_lookup, and checks it is still discoverable afterward
+     * (EEPROM_CHECKSUM_ERROR - correctly flagging the data as bad - not
+     * EEPROM_NOT_FOUND, which would mean it was lost).
+     */
+    eeprom_config_t cfg = make_gc_regression_config();
+    uint8_t data[8];
+    uint8_t filler[8];
+    uint8_t rd[8];
+    uint8_t sz;
+    uint16_t a;
+    eeprom_stats_t stats;
+
+    memset(data, 0x11U, sizeof(data));
+    memset(filler, 0x22U, sizeof(filler));
+
+    reset_flash();
+    g_fail_erase_addr = 0xFFFFFFFFU;
+    CHECK(eeprom_init(&cfg) == EEPROM_OK, "init failed");
+
+    /* First-ever write lands at sector 0, offset SECTOR_HEADER_SIZE (16)
+     * from the sector base - the record header's status byte is
+     * therefore at exactly FLASH_BASE + 16 (see TC-011's identical
+     * addressing for the record's data byte, at + 4 more). */
+    CHECK(eeprom_write(0x0005U, data, sizeof(data)) == EEPROM_OK, "seed write failed");
+    CHECK(eeprom_exists(0x0005U), "seed record not visible before corruption");
+
+    *flash_byte(FLASH_BASE + 16U) ^= 0x01U; /* VALID (0xFF) -> 0xFE: neither VALID nor INVALID */
+
+    sz = sizeof(rd);
+    CHECK(eeprom_read(0x0005U, rd, &sz) == EEPROM_CHECKSUM_ERROR,
+          "corrupted status byte not detected as a checksum/status error");
+    CHECK(eeprom_exists(0x0005U), "record disappeared immediately after corruption, before any GC");
+
+    for (a = 0x0010U; a < (0x0010U + 60U); a++) {
+        /* See the identical note in AUDIT-2: the specific write that
+         * triggers the eager GC reclaim can legitimately return
+         * EEPROM_SECTOR_FULL if the migrated survivors exactly fill the
+         * newly-active sector - not a bug under test here. */
+        eeprom_status_t rc = eeprom_write(a, filler, sizeof(filler));
+        CHECK((rc == EEPROM_OK) || (rc == EEPROM_SECTOR_FULL), "unexpected write status during fill");
+    }
+
+    CHECK(eeprom_get_stats(&stats) == EEPROM_OK, "get_stats failed");
+    CHECK(stats.gc_runs >= 1U, "test setup did not trigger a GC reclaim");
+
+    sz = sizeof(rd);
+    CHECK(eeprom_read(0x0005U, rd, &sz) == EEPROM_CHECKSUM_ERROR,
+          "corrupted record was lost during GC instead of preserved as unreadable");
+    CHECK(eeprom_exists(0x0005U), "record no longer exists() after GC");
+
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                   */
 /* --------------------------------------------------------------------- */
 
@@ -1031,6 +1109,7 @@ static const test_case_t k_tests[] = {
     { "TC-020", "MISRA-C Compliance Check",           tc_020 },
     { "AUDIT-1", "GC power loss with spare (regression)", tc_audit_gc_power_loss },
     { "AUDIT-2", "erase_count persists across reboot (regression)", tc_audit_erase_count_persists_empty_sector },
+    { "AUDIT-3", "GC preserves corrupted record (regression)", tc_audit_gc_preserves_corrupted_record },
 };
 
 int main(void)
