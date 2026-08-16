@@ -934,6 +934,77 @@ static bool tc_audit_gc_power_loss(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* AUDIT-2: erase_count lost across a reboot catching a sector EMPTY      */
+/* (regression test for a bug found by property-based, randomized-fault   */
+/* stress testing - see IMPLEMENTATION_NOTES.md's "Property-based stress  */
+/* testing findings")                                                     */
+/* --------------------------------------------------------------------- */
+
+static bool tc_audit_erase_count_persists_empty_sector(void)
+{
+    /* A sector's lifetime erase_count used to be persisted to flash ONLY
+     * inside activate_sector()/mark_gc_destination() - so a sector that
+     * had just been reclaimed by GC (erased, sitting EMPTY) but not yet
+     * reactivated had NO on-flash record of its count at all. A reboot
+     * catching it in exactly that window read its header as fully blank
+     * and silently reset the count to 0.
+     *
+     * This drives enough small, never-overwritten writes to force one
+     * full sector reclaim (leaving that sector idle and EMPTY, since the
+     * newly-promoted active sector still has headroom right after
+     * rotation completes), then reboots immediately - no further write in
+     * between - and checks the total lifetime erase_count across all
+     * sectors did not drop.
+     */
+    eeprom_config_t cfg = make_gc_regression_config();
+    uint8_t data[8];
+    uint16_t addr = 0x0001U;
+    eeprom_stats_t stats_before;
+    eeprom_stats_t stats_after;
+    uint32_t total_before;
+    uint32_t total_after;
+    uint8_t i;
+    eeprom_status_t rc;
+
+    memset(data, 0xABU, sizeof(data));
+    reset_flash();
+    g_fail_erase_addr = 0xFFFFFFFFU;
+    CHECK(eeprom_init(&cfg) == EEPROM_OK, "init failed");
+
+    stats_before.gc_runs = 0U;
+    for (i = 0; i < 100U; i++) {
+        /* The write that triggers the eager GC reclaim below can itself
+         * legitimately come back EEPROM_SECTOR_FULL if the reclaimed
+         * sector's migrated survivors exactly fill the newly-active
+         * sector (an artifact of this test's record/sector-size
+         * arithmetic, not a bug under test) - only gc_runs matters here. */
+        rc = eeprom_write(addr, data, sizeof(data));
+        CHECK((rc == EEPROM_OK) || (rc == EEPROM_SECTOR_FULL), "unexpected write status during fill");
+        addr++;
+        CHECK(eeprom_get_stats(&stats_before) == EEPROM_OK, "get_stats failed");
+        if (stats_before.gc_runs >= 1U) {
+            break;
+        }
+    }
+    CHECK(stats_before.gc_runs >= 1U, "test setup did not trigger a GC reclaim");
+
+    total_before = stats_before.erase_count[0] + stats_before.erase_count[1] +
+                   stats_before.erase_count[2] + stats_before.erase_count[3];
+    CHECK(total_before >= 1U, "no sector shows a nonzero erase count before reboot");
+
+    CHECK(eeprom_init(&cfg) == EEPROM_OK, "re-init failed");
+    CHECK(eeprom_get_stats(&stats_after) == EEPROM_OK, "get_stats after reboot failed");
+    total_after = stats_after.erase_count[0] + stats_after.erase_count[1] +
+                  stats_after.erase_count[2] + stats_after.erase_count[3];
+
+    CHECK(total_after >= total_before,
+          "lifetime erase_count decreased across a reboot - lost for a sector that "
+          "was sitting EMPTY (erased, not yet reactivated)");
+
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                   */
 /* --------------------------------------------------------------------- */
 
@@ -959,6 +1030,7 @@ static const test_case_t k_tests[] = {
     { "TC-019", "Lookup Table Integrity",             tc_019 },
     { "TC-020", "MISRA-C Compliance Check",           tc_020 },
     { "AUDIT-1", "GC power loss with spare (regression)", tc_audit_gc_power_loss },
+    { "AUDIT-2", "erase_count persists across reboot (regression)", tc_audit_erase_count_persists_empty_sector },
 };
 
 int main(void)

@@ -261,6 +261,41 @@ static int write_sector_header(uint8_t sector_index, uint32_t sequence,
     return 0;
 }
 
+/**
+ * Best-effort persistence of a just-erased sector's lifetime erase_count,
+ * called immediately after every transition to SECTOR_STATE_EMPTY.
+ *
+ * Audit fix: without this, erase_count is only ever written to flash
+ * inside activate_sector()/mark_gc_destination() - so a sector that has
+ * been erased (via GC, the eeprom_init() extra-ACTIVE recovery path, or
+ * eeprom_format()) but has not yet been reactivated has NO on-flash
+ * record of its erase count at all: read_sector_header() sees a fully
+ * blank (all-0xFF) header, and scan_all_sectors() - correctly, for a
+ * sector that has genuinely never been written - treats that as
+ * erase_count 0. A reboot that catches a sector in exactly that window
+ * silently loses its true lifetime count, breaking the "lifetime"
+ * guarantee eeprom_stats_t.erase_count documents and, transitively, any
+ * wear-leveling health check built on it. Found via randomized-reboot
+ * property-based stress testing.
+ *
+ * Deliberately passes SEQUENCE_ERASED_MARK for the sequence field rather
+ * than 0: under this format's AND-only write semantics a byte can only
+ * have bits cleared, never set, so writing 0 here would permanently trap
+ * that field at 0 - a later activate_sector()/mark_gc_destination() call
+ * would never be able to AND-narrow it back up to a real, non-zero
+ * sequence number. SEQUENCE_ERASED_MARK (0xFFFFFFFF) is what the field
+ * already reads as immediately after an erase, so writing it back is a
+ * true no-op there, leaving it free for a later real value while still
+ * durably recording erase_count. Best-effort (return value ignored) for
+ * the same reason invalidate_record() is: on failure, behavior simply
+ * reverts to the pre-fix state for this one sector, not a new regression.
+ */
+static void persist_empty_sector_erase_count(uint8_t sector_index)
+{
+    (void)write_sector_header(sector_index, SEQUENCE_ERASED_MARK, SECTOR_STATE_EMPTY,
+                               g_sectors[sector_index].erase_count);
+}
+
 static int8_t find_empty_sector(void)
 {
     uint8_t i;
@@ -605,6 +640,7 @@ static eeprom_status_t perform_garbage_collection(void)
     g_sectors[(uint8_t)src].sequence = 0;
     g_sectors[(uint8_t)src].state = SECTOR_STATE_EMPTY;
     g_sectors[(uint8_t)src].write_offset = SECTOR_HEADER_SIZE;
+    persist_empty_sector_erase_count((uint8_t)src);
     g_stats.erase_count[(uint8_t)src] = g_sectors[(uint8_t)src].erase_count;
     g_stats.sector_usage[(uint8_t)src] = 0;
     g_stats.gc_runs += 1U;
@@ -775,6 +811,7 @@ static void scan_all_sectors(void)
             g_sectors[i].state = SECTOR_STATE_EMPTY;
             g_sectors[i].erase_count = 0;
             g_sectors[i].write_offset = SECTOR_HEADER_SIZE;
+            persist_empty_sector_erase_count(i);
         } else {
             g_sectors[i].sequence = seq;
             g_sectors[i].state = state;
@@ -902,6 +939,7 @@ eeprom_status_t eeprom_init(const eeprom_config_t *config)
             g_sectors[i].sequence = 0;
             g_sectors[i].state = SECTOR_STATE_EMPTY;
             g_sectors[i].write_offset = SECTOR_HEADER_SIZE;
+            persist_empty_sector_erase_count(i);
             g_stats.erase_count[i] = g_sectors[i].erase_count;
         }
     }
@@ -1058,6 +1096,7 @@ eeprom_status_t eeprom_format(void)
         g_sectors[i].sequence = 0;
         g_sectors[i].state = SECTOR_STATE_EMPTY;
         g_sectors[i].write_offset = SECTOR_HEADER_SIZE;
+        persist_empty_sector_erase_count(i);
         g_stats.erase_count[i] = g_sectors[i].erase_count;
         g_stats.sector_usage[i] = 0;
     }
