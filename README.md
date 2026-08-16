@@ -100,13 +100,13 @@ used from an RTOS with more than one writer.
 
 ### Reducing RAM usage
 
-The default 0x0000-0x0FFF address space costs a 16 KiB lookup table
-(`g_lookup`, one `uint32_t` per address), which is too large for small-RAM
-parts like the STM32F103C8 (20 KiB total). If your application only needs
-a handful of variables, define `EEPROM_MAX_VIRTUAL_ADDR` to a smaller
-value before including `eeprom.h` (e.g. `0x003FU` for 64 addresses costs
-256 bytes instead of 16 KiB). See the macro's doc comment in
-[inc/eeprom.h](inc/eeprom.h) for the one constraint it must respect.
+The default 0x0000-0x0FFF address space costs 16 KiB of RAM, which is too
+large for small-RAM parts like the STM32F103C8 (20 KiB total). If your
+application only needs a handful of variables, define
+`EEPROM_MAX_VIRTUAL_ADDR` to a smaller value before including `eeprom.h`
+(e.g. `0x003FU` for 64 addresses costs only 256 bytes instead of 16 KiB).
+See the macro's doc comment in [inc/eeprom.h](inc/eeprom.h) for the one
+constraint it must respect.
 
 ## Building & testing
 
