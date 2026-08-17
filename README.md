@@ -167,10 +167,3 @@ EEPROM_SPEC.md                Original design specification
 EEPROM_TEST_CASES.md          Original 20 test-case specification
 ```
 
-## License
-
-No license file is included yet — add one (e.g. `LICENSE`) before treating
-this as usable by anyone outside this repository. Until a license is
-present, standard copyright default applies (all rights reserved), which
-in practice means no one else can legally use, modify, or redistribute
-this code even though it's visible on GitHub.
